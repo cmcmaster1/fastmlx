@@ -253,7 +253,7 @@ async def chat_completion(request: ChatCompletionRequest):
             )
 
     # Parse the output to check for function calls
-    return handle_function_calls(output, request, token_length_info)
+    return handle_function_calls(output, model_data, token_length_info)
 
 
 @app.get("/v1/supported_models", response_model=SupportedModels)
@@ -269,21 +269,17 @@ async def get_supported_models():
 
 @app.get("/v1/models")
 async def list_models():
-    """
-    Get list of models - provided in OpenAI API compliant format.
-    """
+    """Get list of models - provided in OpenAI API compliant format."""
     models = await model_provider.get_available_models()
     models_data = []
     for model in models:
-        models_data.append(
-            {
-                "id": model,
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "system",
-            }
-        )
-    return {"object": "list", "data": models_data}
+        models_data.append({
+            "id": model,
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": "system",
+        })
+    return {"object": "list", "data": models_data}  # This matches OpenAI's format
 
 
 @app.post("/v1/models")

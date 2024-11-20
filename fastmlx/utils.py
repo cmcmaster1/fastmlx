@@ -17,6 +17,8 @@ from .types.chat.chat_completion import (
     Usage,
 )
 
+from .tool_parser import ToolParser
+
 # MLX Imports
 try:
     import mlx.core as mx
@@ -163,144 +165,33 @@ def apply_lm_chat_template(
 
 
 def handle_function_calls(
-    output: str, request: ChatCompletionRequest, token_info: Usage
+    output: str, model_data: Dict[str, Any], token_info: Usage
 ) -> ChatCompletionResponse:
-    tool_calls = []
-
-    # Check for JSON format tool calls
-    json_match = re.search(r'\{.*"tool_calls":\s*\[.*\].*\}', output, re.DOTALL)
-    if json_match:
-        try:
-            json_data = json.loads(json_match.group())
-            for call in json_data.get("tool_calls", []):
-                tool_calls.append(
-                    ToolCall(
-                        id=f"call_{os.urandom(4).hex()}",
-                        function=FunctionCall(
-                            name=call["name"], arguments=json.dumps(call["arguments"])
-                        ),
-                    )
-                )
-            # Remove the JSON from the output
-            output = re.sub(
-                r'\{.*"tool_calls":\s*\[.*\].*\}', "", output, flags=re.DOTALL
-            ).strip()
-        except json.JSONDecodeError as e:
-            print(f"Error parsing JSON tool calls: {e}")
-
-    # Check for XML-style function calls
-    # Check for function calls in both old and new XML formats
-    elif "<function_calls>" in output.lower():
-        try:
-            # Try parsing old format
-            function_calls = re.findall(r"<function=(\w+)>\s*({[^<>]+})", output)
-            for function_name, args_str in function_calls:
-                args = json.loads(args_str)
-                tool_calls.append(
-                    ToolCall(
-                        id=f"call_{os.urandom(4).hex()}",
-                        function=FunctionCall(
-                            name=function_name, arguments=json.dumps(args)
-                        ),
-                    )
-                )
-
-            # Try parsing new XML format
-            invoke_blocks = re.findall(
-                r"<invoke>(.*?)</invoke>", output, re.DOTALL | re.IGNORECASE
-            )
-            for block in invoke_blocks:
-                tool_name = re.search(
-                    r"<tool_name>(.*?)</tool_name>", block, re.IGNORECASE
-                )
-                parameters = re.findall(r"<(\w+)>(.*?)</\1>", block, re.IGNORECASE)
-
-                if tool_name:
-                    args = {
-                        param[0].lower(): param[1]
-                        for param in parameters
-                        if param[0].lower() != "tool_name"
-                    }
-                    tool_calls.append(
-                        ToolCall(
-                            id=f"call_{os.urandom(4).hex()}",
-                            function=FunctionCall(
-                                name=tool_name.group(1), arguments=json.dumps(args)
-                            ),
-                        )
-                    )
-
-            # Remove the function calls from the output
-            output = re.sub(
-                r"<function_calls>.*</function_calls>",
-                "",
-                output,
-                flags=re.DOTALL | re.IGNORECASE,
-            ).strip()
-        except Exception as e:
-            print(f"Error parsing function call: {e}")
-
-    elif "functools[" in output:
-        try:
-            functools_match = re.search(r"functools\[(.*?)\]", output, re.DOTALL)
-            if functools_match:
-                functools_data = json.loads(f"[{functools_match.group(1)}]")
-                for call in functools_data:
-                    tool_calls.append(
-                        ToolCall(
-                            id=f"call_{os.urandom(4).hex()}",
-                            function=FunctionCall(
-                                name=call["name"],
-                                arguments=json.dumps(call["arguments"]),
-                            ),
-                        )
-                    )
-                # Remove the functools call from the output
-                output = re.sub(
-                    r"functools\[.*?\]", "", output, flags=re.DOTALL
-                ).strip()
-        except Exception as e:
-            print(f"Error parsing functools call: {e}")
-
-    # New: Check for Qwen-style <tool_call> function calls
-    elif "<tool_call>" in output:
-        try:
-            # Find all <tool_call>...</tool_call> blocks
-            qwen_calls = re.findall(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", output, re.DOTALL)
-            for call_str in qwen_calls:
-                call_data = json.loads(call_str)
-                tool_calls.append(
-                    ToolCall(
-                        id=f"call_{os.urandom(4).hex()}",
-                        function=FunctionCall(
-                            name=call_data["name"],
-                            arguments=json.dumps(call_data["arguments"])
-                        ),
-                    )
-                )
-            # Remove all <tool_call>...</tool_call> blocks from the output
-            output = re.sub(r"<tool_call>\s*\{.*?\}\s*</tool_call>", "", output, flags=re.DOTALL).strip()
-        except json.JSONDecodeError as e:
-            print(f"Error parsing Qwen tool calls: {e}")
-        except Exception as e:
-            print(f"Unexpected error parsing Qwen tool calls: {e}")
-
+    """Handle function calls in model output."""
+    # Get the parser if specified, otherwise use auto parser
+    parser = model_data.get("tool_parser", ToolParser.get_parser())
+    
+    # Parse the output if we have a parser
+    if parser:
+        cleaned_output, tool_calls = parser(output)
+    else:
+        cleaned_output, tool_calls = output, []
+    
     # Prepare the response
     response = ChatCompletionResponse(
         id=f"chatcmpl-{os.urandom(4).hex()}",
         created=int(time.time()),
-        model=request.model,
+        model=model_data.get("model_name", "unknown"),  # Add default value
         usage=token_info,
         choices=[
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": output},
+                "message": {"role": "assistant", "content": cleaned_output},
                 "finish_reason": "stop" if not tool_calls else "tool_call",
             }
         ],
         tool_calls=tool_calls,
     )
-
     return response
 
 
@@ -308,11 +199,17 @@ def handle_function_calls(
 def load_vlm_model(model_name: str, config: Dict[str, Any]) -> Dict[str, Any]:
     model, processor = vlm_load(model_name, {"trust_remote_code": True})
     image_processor = load_image_processor(model_name)
+    
+    # Get the tool parser from config or default to auto
+    tool_parser = ToolParser.get_parser(config.get("tool_parser"))
+    
     return {
         "model": model,
         "processor": processor,
         "image_processor": image_processor,
         "config": config,
+        "tool_parser": tool_parser,
+        "model_name": model_name
     }
 
 
@@ -320,7 +217,17 @@ def load_lm_model(model_name: str, config: Dict[str, Any]) -> Dict[str, Any]:
     time_start = time.time()
     model, tokenizer = lm_load(model_name, model_config=config)
     print(f"Model loaded in {time.time() - time_start:.2f} seconds.")
-    return {"model": model, "tokenizer": tokenizer, "config": config}
+    
+    # Get the tool parser from config or default to auto
+    tool_parser = ToolParser.get_parser(config.get("tool_parser"))
+    
+    return {
+        "model": model,
+        "tokenizer": tokenizer,
+        "config": config,
+        "tool_parser": tool_parser,
+        "model_name": model_name
+    }
 
 
 def vlm_stream_generator(
